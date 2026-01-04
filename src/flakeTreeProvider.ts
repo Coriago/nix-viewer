@@ -23,6 +23,14 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
     private _onStatusUpdate = new vscode.EventEmitter<StatusUpdate>();
     readonly onStatusUpdate = this._onStatusUpdate.event;
 
+    /** Event emitter for when paths are indexed (for search) */
+    private _onPathIndexed = new vscode.EventEmitter<string>();
+    readonly onPathIndexed = this._onPathIndexed.event;
+
+    /** Event emitter for filter changes */
+    private _onFilterChanged = new vscode.EventEmitter<string>();
+    readonly onFilterChanged = this._onFilterChanged.event;
+
     private rootNode?: FlakeNode;
     private flakePath: string;
     private nixRunner: NixRunner;
@@ -39,6 +47,12 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
     /** Prefetch cache for common paths */
     private prefetchCache = new Map<string, FlakeNode[]>();
     private prefetchInProgress = false;
+
+    /** Current filter path (for search) */
+    private filterPath: string = '';
+
+    /** All known attribute paths for search indexing */
+    private knownPaths = new Set<string>();
 
     constructor(
         flakePath: string,
@@ -61,6 +75,55 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
     }
 
     /**
+     * Set the filter path for search.
+     * When set, only shows nodes matching or containing this path.
+     */
+    setFilterPath(path: string): void {
+        this.filterPath = path.trim();
+        logger.log(`Filter path set to: "${this.filterPath}"`);
+        this._onDidChangeTreeData.fire(undefined);
+        
+        if (this.filterPath) {
+            this.emitStatus('info', `Filtered to: ${this.filterPath}`);
+        } else {
+            this.emitStatus('info', 'Filter cleared');
+        }
+        
+        this._onFilterChanged.fire(this.filterPath);
+    }
+
+    /**
+     * Get the current filter path.
+     */
+    getFilterPath(): string {
+        return this.filterPath;
+    }
+
+    /**
+     * Clear the search filter.
+     */
+    clearFilter(): void {
+        this.setFilterPath('');
+    }
+
+    /**
+     * Get all known paths for search indexing.
+     */
+    getKnownPaths(): Set<string> {
+        return this.knownPaths;
+    }
+
+    /**
+     * Index a path for search functionality.
+     */
+    private indexPath(attrPath: string): void {
+        if (attrPath && !this.knownPaths.has(attrPath)) {
+            this.knownPaths.add(attrPath);
+            this._onPathIndexed.fire(attrPath);
+        }
+    }
+
+    /**
      * Get the configured root path.
      */
     private getRootPath(): string {
@@ -70,6 +133,13 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
         return configValue
             .replace(/\$\{hostname\}/g, this.hostname || '')
             .replace(/\$\{user\}/g, this.username || '');
+    }
+
+    /**
+     * Get the configured root path (public accessor for search).
+     */
+    getConfiguredRootPath(): string {
+        return this.getRootPath();
     }
 
     /**
@@ -117,16 +187,21 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
                 if (result.success) {
                     const attrNames = result.data as string[];
                     const children: FlakeNode[] = attrNames.sort().map(name => {
+                        const childPath = `${fullPath}.${name}`;
                         const child = new FlakeNode(
                             name,
-                            `${fullPath}.${name}`,
+                            childPath,
                             FlakeNodeType.Attrset,
                             vscode.TreeItemCollapsibleState.Collapsed
                         );
+                        // Index path for search
+                        this.indexPath(childPath);
                         return child;
                     });
                     this.prefetchCache.set(fullPath, children);
                     this.lastGoodChildren.set(fullPath, children);
+                    // Also index the parent path
+                    this.indexPath(fullPath);
                     logger.log(`✓ Prefetched ${children.length} attrs for: ${subPath}`);
                 }
             } catch (error) {
@@ -146,6 +221,7 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
     refresh(): void {
         this.rootNode = undefined;
         this.prefetchCache.clear();
+        this.knownPaths.clear();
         this._onDidChangeTreeData.fire(undefined);
         this.emitStatus('info', 'Refreshing flake outputs...');
         // Restart prefetching in background
@@ -168,6 +244,77 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
     }
 
     /**
+     * Convert an absolute path to a relative path (relative to root).
+     */
+    private toRelativePath(absolutePath: string): string {
+        const rootPath = this.getRootPath();
+        if (!rootPath) {
+            return absolutePath;
+        }
+        
+        // If the path starts with the root path, strip it
+        if (absolutePath.startsWith(rootPath + '.')) {
+            return absolutePath.slice(rootPath.length + 1);
+        }
+        
+        // If the path equals the root path, return empty
+        if (absolutePath === rootPath) {
+            return '';
+        }
+        
+        // Path doesn't start with root - return as-is
+        return absolutePath;
+    }
+
+    /**
+     * Apply filter to children nodes.
+     * Filter path is relative to the configured root path.
+     * Shows nodes that:
+     * - Match the filter path exactly
+     * - Are ancestors of the filter path (path leads to filter)
+     * - Are descendants of the filter path (path starts with filter)
+     * - Have labels that fuzzy-match the filter
+     */
+    private applyFilter(children: FlakeNode[]): FlakeNode[] {
+        if (!this.filterPath) {
+            return children;
+        }
+
+        const filterLower = this.filterPath.toLowerCase();
+        
+        return children.filter(child => {
+            // Convert child's absolute path to relative for comparison
+            const childRelativePath = this.toRelativePath(child.attrPath);
+            const childPathLower = childRelativePath.toLowerCase();
+            const childLabelLower = (child.label as string)?.toLowerCase() || '';
+            
+            // Exact match
+            if (childPathLower === filterLower) {
+                return true;
+            }
+            
+            // Child is ancestor of filter (filter path starts with child path)
+            // e.g., child="programs", filter="programs.git"
+            if (filterLower.startsWith(childPathLower + '.')) {
+                return true;
+            }
+            
+            // Child is descendant of filter (child path starts with filter path)
+            // e.g., child="programs.git.enable", filter="programs.git"
+            if (childPathLower.startsWith(filterLower + '.') || childPathLower.startsWith(filterLower)) {
+                return true;
+            }
+            
+            // Label fuzzy match for simple searches
+            if (childLabelLower.includes(filterLower) || filterLower.includes(childLabelLower)) {
+                return true;
+            }
+            
+            return false;
+        });
+    }
+
+    /**
      * Get tree item for display.
      */
     getTreeItem(element: FlakeNode): vscode.TreeItem {
@@ -185,17 +332,23 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
         try {
             if (!element) {
                 // Root level
-                return this.getRootChildren();
+                const children = await this.getRootChildren();
+                return this.applyFilter(children);
             }
 
             // Check cache first
             const cached = element.getCachedChildren();
             if (cached) {
-                return cached;
+                return this.applyFilter(cached);
             }
 
             // Fetch children based on node type
             const children = await this.fetchChildren(element);
+
+            // Index paths for search
+            for (const child of children) {
+                this.indexPath(child.attrPath);
+            }
 
             // Cache for resilience
             if (children.length > 0 && element.nodeType !== FlakeNodeType.Error) {
@@ -203,7 +356,7 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
                 this.lastGoodChildren.set(element.attrPath, children);
             }
 
-            return children;
+            return this.applyFilter(children);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             this.emitStatus('error', `Failed to get children: ${message}`);
@@ -268,6 +421,8 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
                 FlakeNodeType.Attrset,
                 vscode.TreeItemCollapsibleState.Collapsed
             );
+            // Index path for search
+            this.indexPath(key);
             children.push(node);
         }
 

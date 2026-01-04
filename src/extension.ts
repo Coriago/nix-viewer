@@ -4,12 +4,16 @@ import { FlakeTreeProvider } from './flakeTreeProvider';
 import { FlakeNode, FlakeNodeType } from './flakeNode';
 import { NixRunner } from './nixRunner';
 import { StatusViewProvider } from './statusView';
+import { SearchViewProvider } from './searchView';
+import { SearchProvider } from './searchProvider';
 import { logger } from './logger';
 
 let outputChannel: vscode.OutputChannel;
 let nixRunner: NixRunner;
 let treeProvider: FlakeTreeProvider;
 let statusProvider: StatusViewProvider;
+let searchViewProvider: SearchViewProvider;
+let searchProvider: SearchProvider;
 let fileWatcher: vscode.FileSystemWatcher | undefined;
 let debounceTimer: NodeJS.Timeout | undefined;
 
@@ -47,11 +51,25 @@ export function activate(context: vscode.ExtensionContext): void {
         treeProvider = new FlakeTreeProvider(workspaceRoot, nixRunner);
         logger.log('Initializing StatusViewProvider...');
         statusProvider = new StatusViewProvider(context.extensionUri);
+        logger.log('Initializing SearchViewProvider...');
+        searchViewProvider = new SearchViewProvider(context.extensionUri);
+        logger.log('Initializing SearchProvider...');
+        searchProvider = new SearchProvider(treeProvider, searchViewProvider);
 
         // Connect status updates
         treeProvider.onStatusUpdate((update) => {
             statusProvider.updateStatus(update);
         });
+
+        // Connect path indexing for search
+        treeProvider.onPathIndexed((path) => {
+            searchProvider.indexPath(path);
+        });
+
+        // Index existing known paths
+        for (const path of treeProvider.getKnownPaths()) {
+            searchProvider.indexPath(path);
+        }
 
         // Register tree view
         logger.log('Registering tree view...');
@@ -60,6 +78,24 @@ export function activate(context: vscode.ExtensionContext): void {
             showCollapseAll: true,
         });
         context.subscriptions.push(treeView);
+
+        // Update tree view description when filter changes
+        treeProvider.onFilterChanged((filterPath) => {
+            if (filterPath) {
+                treeView.description = `Filter: ${filterPath}`;
+            } else {
+                treeView.description = undefined;
+            }
+        });
+
+        // Register search webview
+        logger.log('Registering search webview...');
+        context.subscriptions.push(
+            vscode.window.registerWebviewViewProvider(
+                SearchViewProvider.viewType,
+                searchViewProvider
+            )
+        );
 
         // Register status webview
         logger.log('Registering status webview...');
@@ -164,6 +200,20 @@ function registerCommands(
                 await config.update('rootPath', newRoot, vscode.ConfigurationTarget.Workspace);
                 treeProvider.refresh();
             }
+        })
+    );
+
+    // Focus search command
+    context.subscriptions.push(
+        vscode.commands.registerCommand('flakeExplorer.focusSearch', () => {
+            searchProvider.focus();
+        })
+    );
+
+    // Clear filter command
+    context.subscriptions.push(
+        vscode.commands.registerCommand('flakeExplorer.clearFilter', () => {
+            searchProvider.clear();
         })
     );
 }

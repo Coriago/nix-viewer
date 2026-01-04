@@ -28,6 +28,13 @@
         "views": {
             "flakeExplorer": [
                 {
+                    "id": "flakeSearch",
+                    "name": "Filter",
+                    "type": "webview",
+                    "visibility": "visible",
+                    "initialSize": 1
+                },
+                {
                     "id": "flakeOutputsTree",
                     "name": "Outputs",
                     "icon": "$(list-tree)",
@@ -61,12 +68,27 @@
                 "command": "flakeExplorer.setRootPath",
                 "title": "Set Root Path",
                 "icon": "$(root-folder)"
+            },
+            {
+                "command": "flakeExplorer.focusSearch",
+                "title": "Focus Search",
+                "icon": "$(search)"
+            },
+            {
+                "command": "flakeExplorer.clearFilter",
+                "title": "Clear Filter",
+                "icon": "$(close)"
             }
         ],
         "menus": {
             "view/title": [
                 {
                     "command": "flakeExplorer.refresh",
+                    "when": "view == flakeOutputsTree",
+                    "group": "navigation"
+                },
+                {
+                    "command": "flakeExplorer.clearFilter",
                     "when": "view == flakeOutputsTree",
                     "group": "navigation"
                 },
