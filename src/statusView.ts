@@ -30,6 +30,28 @@ export class StatusViewProvider implements vscode.WebviewViewProvider {
         };
 
         webviewView.webview.html = this.getHtmlContent();
+
+        // Restore status history when webview is created
+        this.restoreStatusHistory();
+
+        // Restore status history when webview becomes visible again
+        webviewView.onDidChangeVisibility(() => {
+            if (webviewView.visible) {
+                this.restoreStatusHistory();
+            }
+        });
+    }
+
+    /**
+     * Restore the status history to the webview.
+     */
+    private restoreStatusHistory(): void {
+        if (this.view && this.statusHistory.length > 0) {
+            this.view.webview.postMessage({
+                type: 'status',
+                updates: this.statusHistory.slice(0, 10),
+            });
+        }
     }
 
     /**
