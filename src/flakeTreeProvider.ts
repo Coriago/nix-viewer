@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { FlakeNode, FlakeNodeType, createLoadingNode, createErrorNode } from './flakeNode';
 import { NixRunner } from './nixRunner';
+import { logger } from './logger';
 
 /**
  * Event emitter for status updates.
@@ -258,32 +259,43 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
         parent.nodeType = FlakeNodeType.List;
         parent.updateAppearance();
 
-        const lenResult = await this.nixRunner.getListLength(this.flakePath, parent.attrPath);
+        // Fetch all list elements info in a single nix eval call (much faster)
+        logger.log(`Fetching list children for: ${parent.attrPath}`);
+        const elementsResult = await this.nixRunner.getListElementsInfo(this.flakePath, parent.attrPath);
 
-        if (!lenResult.success) {
-            this.emitStatus('error', lenResult.error || 'Failed to get list length');
+        if (!elementsResult.success) {
+            logger.error(`Failed to get list elements for ${parent.attrPath}: ${elementsResult.error}`);
+            this.emitStatus('error', elementsResult.error || 'Failed to get list elements');
             const lastGood = this.lastGoodChildren.get(parent.attrPath);
             if (lastGood) {
                 return lastGood;
             }
-            return [createErrorNode(lenResult.error || 'Failed to evaluate', parent)];
+            return [createErrorNode(elementsResult.error || 'Failed to evaluate', parent)];
         }
 
-        const length = lenResult.data as number;
+        const elements = elementsResult.data as Array<{ index: number; name: string; isDrv: boolean }>;
         const children: FlakeNode[] = [];
 
-        // Fetch info for each element (in batches for performance)
-        const batchSize = 20;
-        for (let i = 0; i < length; i += batchSize) {
-            const batch = await Promise.all(
-                Array.from({ length: Math.min(batchSize, length - i) }, (_, j) =>
-                    this.fetchListElementNode(parent, i + j)
-                )
+        for (const elem of elements) {
+            const child = new FlakeNode(
+                elem.name,
+                `${parent.attrPath}.[${elem.index}]`,  // Use bracket notation for list access
+                elem.isDrv ? FlakeNodeType.Derivation : FlakeNodeType.ListElement,
+                // Derivations in lists are typically packages - don't make them expandable
+                elem.isDrv ? vscode.TreeItemCollapsibleState.None : vscode.TreeItemCollapsibleState.Collapsed
             );
-            children.push(...batch);
+            child.listIndex = elem.index;
+            child.parent = parent;
+            child.updateAppearance();
+            // Override for derivations to not be expandable
+            if (elem.isDrv) {
+                child.collapsibleState = vscode.TreeItemCollapsibleState.None;
+            }
+            children.push(child);
         }
 
-        this.emitStatus('success', `Loaded ${length} list items`);
+        logger.log(`✓ Loaded ${children.length} list items for: ${parent.attrPath}`);
+        this.emitStatus('success', `Loaded ${children.length} list items`);
         return children;
     }
 

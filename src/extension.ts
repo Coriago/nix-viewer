@@ -4,6 +4,7 @@ import { FlakeTreeProvider } from './flakeTreeProvider';
 import { FlakeNode, FlakeNodeType } from './flakeNode';
 import { NixRunner } from './nixRunner';
 import { StatusViewProvider } from './statusView';
+import { logger } from './logger';
 
 let outputChannel: vscode.OutputChannel;
 let nixRunner: NixRunner;
@@ -17,7 +18,7 @@ let debounceTimer: NodeJS.Timeout | undefined;
  */
 export function activate(context: vscode.ExtensionContext): void {
     try {
-        console.log('=== Nix Flake Explorer: Starting activation ===');
+        logger.log('=== Nix Flake Explorer: Starting activation ===');
         outputChannel = vscode.window.createOutputChannel('Nix Flake Explorer');
         context.subscriptions.push(outputChannel);
         outputChannel.show(); // Show output panel on activation
@@ -26,25 +27,25 @@ export function activate(context: vscode.ExtensionContext): void {
         const workspaceRoot = getWorkspaceRoot();
         if (!workspaceRoot) {
             const msg = 'ERROR: No workspace folder found';
-            console.error(msg);
+            logger.error(msg);
             outputChannel.appendLine(msg);
             vscode.window.showErrorMessage('Nix Flake Explorer: No workspace folder found');
             return;
         }
-        console.log(`Workspace root: ${workspaceRoot}`);
+        logger.log(`Workspace root: ${workspaceRoot}`);
         outputChannel.appendLine(`Workspace root: ${workspaceRoot}`);
 
         // Check for flake.nix
         const flakePath = path.join(workspaceRoot, 'flake.nix');
-        console.log(`Looking for flake at: ${flakePath}`);
+        logger.log(`Looking for flake at: ${flakePath}`);
         outputChannel.appendLine(`Looking for flake at: ${flakePath}`);
 
         // Initialize components
-        console.log('Initializing NixRunner...');
+        logger.log('Initializing NixRunner...');
         nixRunner = new NixRunner(outputChannel);
-        console.log('Initializing FlakeTreeProvider...');
+        logger.log('Initializing FlakeTreeProvider...');
         treeProvider = new FlakeTreeProvider(workspaceRoot, nixRunner);
-        console.log('Initializing StatusViewProvider...');
+        logger.log('Initializing StatusViewProvider...');
         statusProvider = new StatusViewProvider(context.extensionUri);
 
         // Connect status updates
@@ -53,7 +54,7 @@ export function activate(context: vscode.ExtensionContext): void {
         });
 
         // Register tree view
-        console.log('Registering tree view...');
+        logger.log('Registering tree view...');
         const treeView = vscode.window.createTreeView('flakeOutputsTree', {
             treeDataProvider: treeProvider,
             showCollapseAll: true,
@@ -61,7 +62,7 @@ export function activate(context: vscode.ExtensionContext): void {
         context.subscriptions.push(treeView);
 
         // Register status webview
-        console.log('Registering status webview...');
+        logger.log('Registering status webview...');
         context.subscriptions.push(
             vscode.window.registerWebviewViewProvider(
                 StatusViewProvider.viewType,
@@ -70,19 +71,18 @@ export function activate(context: vscode.ExtensionContext): void {
         );
 
         // Register commands
-        console.log('Registering commands...');
+        logger.log('Registering commands...');
         registerCommands(context, treeView);
 
         // Set up file watching
-        console.log('Setting up file watcher...');
+        logger.log('Setting up file watcher...');
         setupFileWatcher(context, workspaceRoot);
 
-        console.log(`✓ Nix Flake Explorer activated successfully for: ${workspaceRoot}`);
+        logger.log(`✓ Nix Flake Explorer activated successfully for: ${workspaceRoot}`);
         outputChannel.appendLine(`Nix Flake Explorer activated for: ${workspaceRoot}`);
     } catch (error) {
         const errorMsg = `FATAL ERROR during activation: ${error}`;
-        console.error(errorMsg);
-        console.error(error);
+        logger.error(errorMsg, error);
         if (outputChannel) {
             outputChannel.appendLine(errorMsg);
             outputChannel.appendLine(String(error));

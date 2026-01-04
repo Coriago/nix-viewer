@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { spawn, ChildProcess } from 'child_process';
+import { logger } from './logger';
 
 export interface NixEvalResult {
     success: boolean;
@@ -116,7 +117,7 @@ export class NixRunner {
             const fullArgs = [...this.buildBaseArgs(), ...args];
 
             const cmdLine = `> nix ${fullArgs.join(' ')}`;
-            console.log(cmdLine);
+            logger.log(cmdLine);
             this.outputChannel.appendLine(cmdLine);
 
             const proc = spawn('nix', fullArgs, {
@@ -153,14 +154,15 @@ export class NixRunner {
                 if (code === 0) {
                     try {
                         const data = stdout.trim() ? JSON.parse(stdout) : null;
+                        logger.log(`✓ Command succeeded: ${processKey}`);
                         resolve({ success: true, data });
                     } catch {
                         // Not JSON, return as string
                         resolve({ success: true, data: stdout.trim() });
                     }
                 } else {
-                    const errorMsg = `Error: ${stderr}`;
-                    console.error(errorMsg);
+                    const errorMsg = `Error (exit ${code}): ${stderr}`;
+                    logger.error(errorMsg);
                     this.outputChannel.appendLine(errorMsg);
                     resolve({ success: false, error: stderr.trim() || `Exit code ${code}` });
                 }
@@ -170,7 +172,7 @@ export class NixRunner {
                 clearTimeout(timer);
                 this.activeProcesses.delete(processKey);
                 const spawnError = `Spawn error: ${err.message}`;
-                console.error(spawnError);
+                logger.error(spawnError);
                 this.outputChannel.appendLine(spawnError);
                 resolve({ success: false, error: err.message });
             });
@@ -178,11 +180,70 @@ export class NixRunner {
     }
 
     /**
+     * Convert an attribute path that may contain list indices (e.g., "foo.[0].bar")
+     * into a Nix expression for evaluation.
+     * Returns { flakeRef, applyPrefix } where applyPrefix wraps the value access.
+     */
+    private parseAttrPath(attrPath: string): { basePath: string; listAccesses: number[] } {
+        // Check for bracket notation like "path.[0]" or "path.[0].[1]"
+        const parts = attrPath.split('.');
+        const baseParts: string[] = [];
+        const listAccesses: number[] = [];
+        
+        for (const part of parts) {
+            const match = part.match(/^\[(\d+)\]$/);
+            if (match) {
+                listAccesses.push(parseInt(match[1], 10));
+            } else {
+                // If we've collected list accesses and hit a non-list part, 
+                // we need a different approach - for now just collect base path
+                if (listAccesses.length === 0) {
+                    baseParts.push(part);
+                } else {
+                    // Complex case: list access followed by attr access
+                    // For now, include it in base and clear list accesses
+                    // This won't work perfectly but handles simple cases
+                    baseParts.push(part);
+                }
+            }
+        }
+        
+        return { basePath: baseParts.join('.'), listAccesses };
+    }
+
+    /**
+     * Build a Nix eval command that handles list indexing properly.
+     */
+    private buildEvalArgs(attrPath: string, applyExpr?: string): string[] {
+        const { basePath, listAccesses } = this.parseAttrPath(attrPath);
+        const flakeRef = basePath ? `.#${basePath}` : '.';
+        
+        if (listAccesses.length > 0) {
+            // Build nested elemAt calls
+            let accessor = 'x';
+            for (const idx of listAccesses) {
+                accessor = `(builtins.elemAt ${accessor} ${idx})`;
+            }
+            
+            const fullApply = applyExpr 
+                ? `x: let v = ${accessor}; in ${applyExpr.replace(/\bx\b/g, 'v')}`
+                : `x: ${accessor}`;
+            
+            return ['eval', '--json', flakeRef, '--apply', fullApply];
+        }
+        
+        if (applyExpr) {
+            return ['eval', '--json', flakeRef, '--apply', applyExpr];
+        }
+        
+        return ['eval', '--json', flakeRef];
+    }
+
+    /**
      * Evaluate an attribute path and get its children (attribute names).
      */
     async getAttrNames(flakePath: string, attrPath: string): Promise<NixEvalResult> {
-        const flakeRef = attrPath ? `.#${attrPath}` : '.';
-        const args = ['eval', '--json', flakeRef, '--apply', 'x: builtins.attrNames x'];
+        const args = this.buildEvalArgs(attrPath, 'x: builtins.attrNames x');
         return this.run(args, { cwd: flakePath }, `attrNames:${attrPath}`);
     }
 
@@ -190,8 +251,7 @@ export class NixRunner {
      * Evaluate an attribute and get its value.
      */
     async getValue(flakePath: string, attrPath: string): Promise<NixEvalResult> {
-        const flakeRef = `.#${attrPath}`;
-        const args = ['eval', '--json', flakeRef];
+        const args = this.buildEvalArgs(attrPath);
         return this.run(args, { cwd: flakePath }, `value:${attrPath}`);
     }
 
@@ -199,8 +259,7 @@ export class NixRunner {
      * Get the type of a value at an attribute path.
      */
     async getValueType(flakePath: string, attrPath: string): Promise<NixEvalResult> {
-        const flakeRef = attrPath ? `.#${attrPath}` : '.';
-        const args = ['eval', '--json', flakeRef, '--apply', 'x: builtins.typeOf x'];
+        const args = this.buildEvalArgs(attrPath, 'x: builtins.typeOf x');
         return this.run(args, { cwd: flakePath }, `type:${attrPath}`);
     }
 
@@ -208,11 +267,7 @@ export class NixRunner {
      * Check if a value is a derivation.
      */
     async isDerivation(flakePath: string, attrPath: string): Promise<NixEvalResult> {
-        const flakeRef = `.#${attrPath}`;
-        const args = [
-            'eval', '--json', flakeRef,
-            '--apply', 'x: (x.type or null) == "derivation" || (x ? drvPath)'
-        ];
+        const args = this.buildEvalArgs(attrPath, 'x: (x.type or null) == "derivation" || (x ? drvPath)');
         return this.run(args, { cwd: flakePath }, `isDrv:${attrPath}`);
     }
 
@@ -223,6 +278,26 @@ export class NixRunner {
         const flakeRef = `.#${attrPath}`;
         const args = ['eval', '--json', flakeRef, '--apply', 'x: builtins.length x'];
         return this.run(args, { cwd: flakePath }, `listLen:${attrPath}`);
+    }
+
+    /**
+     * Get all list elements info in a single evaluation (much faster than per-element).
+     */
+    async getListElementsInfo(
+        flakePath: string,
+        attrPath: string
+    ): Promise<NixEvalResult> {
+        const flakeRef = `.#${attrPath}`;
+        const args = [
+            'eval', '--json', flakeRef,
+            '--apply', `xs: builtins.genList (i: let e = builtins.elemAt xs i; in { 
+        index = i;
+        name = e.name or e.pname or (toString i); 
+        isDrv = (e.type or null) == "derivation" || (e ? drvPath);
+      }) (builtins.length xs)`
+        ];
+        console.log(`Fetching all list elements for: ${attrPath}`);
+        return this.run(args, { cwd: flakePath }, `listElems:${attrPath}`);
     }
 
     /**
