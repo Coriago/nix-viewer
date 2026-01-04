@@ -1,0 +1,397 @@
+import * as vscode from 'vscode';
+import { FlakeNode, FlakeNodeType, createLoadingNode, createErrorNode } from './flakeNode';
+import { NixRunner } from './nixRunner';
+
+/**
+ * Event emitter for status updates.
+ */
+export interface StatusUpdate {
+    type: 'info' | 'error' | 'success';
+    message: string;
+    timestamp: Date;
+}
+
+/**
+ * Tree data provider for flake outputs.
+ */
+export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
+    private _onDidChangeTreeData = new vscode.EventEmitter<FlakeNode | undefined | null>();
+    readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+
+    private _onStatusUpdate = new vscode.EventEmitter<StatusUpdate>();
+    readonly onStatusUpdate = this._onStatusUpdate.event;
+
+    private rootNode?: FlakeNode;
+    private flakePath: string;
+    private nixRunner: NixRunner;
+
+    /** Last known good state for error resilience */
+    private lastGoodChildren = new Map<string, FlakeNode[]>();
+
+    constructor(
+        flakePath: string,
+        nixRunner: NixRunner
+    ) {
+        this.flakePath = flakePath;
+        this.nixRunner = nixRunner;
+    }
+
+    /**
+     * Update the flake path (workspace root).
+     */
+    setFlakePath(path: string): void {
+        this.flakePath = path;
+        this.refresh();
+    }
+
+    /**
+     * Get the configured root path.
+     */
+    private getRootPath(): string {
+        return vscode.workspace.getConfiguration('nixFlakeExplorer').get<string>('rootPath', '');
+    }
+
+    /**
+     * Refresh the entire tree.
+     */
+    refresh(): void {
+        this.rootNode = undefined;
+        this._onDidChangeTreeData.fire(undefined);
+        this.emitStatus('info', 'Refreshing flake outputs...');
+    }
+
+    /**
+     * Refresh a specific node.
+     */
+    refreshNode(node: FlakeNode): void {
+        node.cache = undefined;
+        this._onDidChangeTreeData.fire(node);
+    }
+
+    /**
+     * Emit a status update.
+     */
+    private emitStatus(type: StatusUpdate['type'], message: string): void {
+        this._onStatusUpdate.fire({ type, message, timestamp: new Date() });
+    }
+
+    /**
+     * Get tree item for display.
+     */
+    getTreeItem(element: FlakeNode): vscode.TreeItem {
+        return element;
+    }
+
+    /**
+     * Get children of a node.
+     */
+    async getChildren(element?: FlakeNode): Promise<FlakeNode[]> {
+        if (!this.flakePath) {
+            return [];
+        }
+
+        try {
+            if (!element) {
+                // Root level
+                return this.getRootChildren();
+            }
+
+            // Check cache first
+            const cached = element.getCachedChildren();
+            if (cached) {
+                return cached;
+            }
+
+            // Fetch children based on node type
+            const children = await this.fetchChildren(element);
+
+            // Cache for resilience
+            if (children.length > 0 && element.nodeType !== FlakeNodeType.Error) {
+                element.cacheChildren(children);
+                this.lastGoodChildren.set(element.attrPath, children);
+            }
+
+            return children;
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            this.emitStatus('error', `Failed to get children: ${message}`);
+
+            // Return last known good state if available
+            const lastGood = element ? this.lastGoodChildren.get(element.attrPath) : undefined;
+            if (lastGood) {
+                return lastGood;
+            }
+
+            return [createErrorNode(message, element)];
+        }
+    }
+
+    /**
+     * Get root-level children.
+     */
+    private async getRootChildren(): Promise<FlakeNode[]> {
+        const rootPath = this.getRootPath();
+
+        if (!rootPath) {
+            // Show top-level flake outputs
+            return this.fetchTopLevelOutputs();
+        }
+
+        // Create a synthetic root for the configured path
+        this.rootNode = new FlakeNode(
+            rootPath.split('.').pop() || 'root',
+            rootPath,
+            FlakeNodeType.Attrset,
+            vscode.TreeItemCollapsibleState.Expanded
+        );
+
+        // Fetch children of the configured root path
+        return this.fetchChildren(this.rootNode);
+    }
+
+    /**
+     * Fetch top-level flake outputs using `nix flake show`.
+     */
+    private async fetchTopLevelOutputs(): Promise<FlakeNode[]> {
+        const result = await this.nixRunner.flakeShow(this.flakePath);
+
+        if (!result.success) {
+            this.emitStatus('error', result.error || 'Failed to show flake');
+            const lastGood = this.lastGoodChildren.get('');
+            if (lastGood) {
+                return lastGood;
+            }
+            return [createErrorNode(result.error || 'Failed to evaluate flake')];
+        }
+
+        this.emitStatus('success', 'Flake outputs loaded');
+
+        const outputs = result.data as Record<string, unknown>;
+        const children: FlakeNode[] = [];
+
+        for (const key of Object.keys(outputs).sort()) {
+            const node = new FlakeNode(
+                key,
+                key,
+                FlakeNodeType.Attrset,
+                vscode.TreeItemCollapsibleState.Collapsed
+            );
+            children.push(node);
+        }
+
+        this.lastGoodChildren.set('', children);
+        return children;
+    }
+
+    /**
+     * Fetch children for a specific node.
+     */
+    private async fetchChildren(parent: FlakeNode): Promise<FlakeNode[]> {
+        // First, determine the type of the parent value
+        const typeResult = await this.nixRunner.getValueType(this.flakePath, parent.attrPath);
+
+        if (!typeResult.success) {
+            this.emitStatus('error', typeResult.error || 'Failed to get type');
+            const lastGood = this.lastGoodChildren.get(parent.attrPath);
+            if (lastGood) {
+                return lastGood;
+            }
+            return [createErrorNode(typeResult.error || 'Failed to evaluate', parent)];
+        }
+
+        const valueType = typeResult.data as string;
+
+        switch (valueType) {
+            case 'set':
+                return this.fetchAttrsetChildren(parent);
+            case 'list':
+                return this.fetchListChildren(parent);
+            default:
+                // It's a leaf value, fetch and display it
+                parent.nodeType = FlakeNodeType.Leaf;
+                parent.collapsibleState = vscode.TreeItemCollapsibleState.None;
+                await this.fetchLeafValue(parent);
+                return [];
+        }
+    }
+
+    /**
+     * Fetch children of an attribute set.
+     */
+    private async fetchAttrsetChildren(parent: FlakeNode): Promise<FlakeNode[]> {
+        // Check if it's a derivation first
+        const drvCheck = await this.nixRunner.isDerivation(this.flakePath, parent.attrPath);
+
+        if (drvCheck.success && drvCheck.data === true) {
+            parent.nodeType = FlakeNodeType.Derivation;
+            parent.updateAppearance();
+            // For derivations, we can still show their attributes
+        }
+
+        const result = await this.nixRunner.getAttrNames(this.flakePath, parent.attrPath);
+
+        if (!result.success) {
+            this.emitStatus('error', result.error || 'Failed to get attributes');
+            const lastGood = this.lastGoodChildren.get(parent.attrPath);
+            if (lastGood) {
+                return lastGood;
+            }
+            return [createErrorNode(result.error || 'Failed to evaluate', parent)];
+        }
+
+        const attrNames = result.data as string[];
+        const children: FlakeNode[] = [];
+
+        for (const name of attrNames.sort()) {
+            const child = parent.createChild(name, FlakeNodeType.Attrset);
+            children.push(child);
+        }
+
+        this.emitStatus('success', `Loaded ${children.length} attributes`);
+        return children;
+    }
+
+    /**
+     * Fetch children of a list (e.g., home.packages).
+     */
+    private async fetchListChildren(parent: FlakeNode): Promise<FlakeNode[]> {
+        parent.nodeType = FlakeNodeType.List;
+        parent.updateAppearance();
+
+        const lenResult = await this.nixRunner.getListLength(this.flakePath, parent.attrPath);
+
+        if (!lenResult.success) {
+            this.emitStatus('error', lenResult.error || 'Failed to get list length');
+            const lastGood = this.lastGoodChildren.get(parent.attrPath);
+            if (lastGood) {
+                return lastGood;
+            }
+            return [createErrorNode(lenResult.error || 'Failed to evaluate', parent)];
+        }
+
+        const length = lenResult.data as number;
+        const children: FlakeNode[] = [];
+
+        // Fetch info for each element (in batches for performance)
+        const batchSize = 20;
+        for (let i = 0; i < length; i += batchSize) {
+            const batch = await Promise.all(
+                Array.from({ length: Math.min(batchSize, length - i) }, (_, j) =>
+                    this.fetchListElementNode(parent, i + j)
+                )
+            );
+            children.push(...batch);
+        }
+
+        this.emitStatus('success', `Loaded ${length} list items`);
+        return children;
+    }
+
+    /**
+     * Create a node for a list element.
+     */
+    private async fetchListElementNode(parent: FlakeNode, index: number): Promise<FlakeNode> {
+        const infoResult = await this.nixRunner.getListElementInfo(
+            this.flakePath,
+            parent.attrPath,
+            index
+        );
+
+        if (infoResult.success && infoResult.data) {
+            const info = infoResult.data as { name: string; isDrv: boolean };
+            const node = new FlakeNode(
+                info.name,
+                `${parent.attrPath}`,
+                info.isDrv ? FlakeNodeType.Derivation : FlakeNodeType.ListElement,
+                vscode.TreeItemCollapsibleState.Collapsed
+            );
+            node.parent = parent;
+            node.listIndex = index;
+            node.tooltip = `${parent.attrPath}[${index}] - ${info.name}`;
+            return node;
+        }
+
+        // Fallback to index-based name
+        const node = new FlakeNode(
+            `[${index}]`,
+            `${parent.attrPath}`,
+            FlakeNodeType.ListElement,
+            vscode.TreeItemCollapsibleState.Collapsed
+        );
+        node.parent = parent;
+        node.listIndex = index;
+        return node;
+    }
+
+    /**
+     * Fetch and display a leaf value.
+     */
+    private async fetchLeafValue(node: FlakeNode): Promise<void> {
+        const result = await this.nixRunner.getValue(this.flakePath, node.attrPath);
+
+        if (result.success) {
+            node.setValue(result.data);
+            node.cache = { value: result.data, timestamp: Date.now() };
+        } else {
+            node.setError(result.error || 'Failed to evaluate');
+        }
+    }
+
+    /**
+     * Get the full value of a node for display.
+     */
+    async getNodeValue(node: FlakeNode): Promise<unknown> {
+        // For list elements, we need special handling
+        if (node.listIndex !== undefined && node.parent) {
+            const result = await this.nixRunner.run(
+                [
+                    'eval', '--json',
+                    `.#${node.parent.attrPath}`,
+                    '--apply', `xs: builtins.elemAt xs ${node.listIndex}`
+                ],
+                { cwd: this.flakePath }
+            );
+            return result.success ? result.data : { error: result.error };
+        }
+
+        const result = await this.nixRunner.getValue(this.flakePath, node.attrPath);
+        return result.success ? result.data : { error: result.error };
+    }
+
+    /**
+     * Get derivation JSON for a node.
+     */
+    async getDerivationInfo(node: FlakeNode): Promise<unknown> {
+        // Get the drvPath
+        let drvPathResult;
+
+        if (node.listIndex !== undefined && node.parent) {
+            drvPathResult = await this.nixRunner.run(
+                [
+                    'eval', '--raw',
+                    `.#${node.parent.attrPath}`,
+                    '--apply', `xs: (builtins.elemAt xs ${node.listIndex}).drvPath`
+                ],
+                { cwd: this.flakePath }
+            );
+        } else {
+            drvPathResult = await this.nixRunner.getDrvPath(this.flakePath, node.attrPath);
+        }
+
+        if (!drvPathResult.success) {
+            return { error: drvPathResult.error };
+        }
+
+        const drvPath = drvPathResult.data as string;
+        const drvResult = await this.nixRunner.getDerivationJson(this.flakePath, drvPath);
+
+        return drvResult.success ? drvResult.data : { error: drvResult.error };
+    }
+
+    /**
+     * Get parent for tree view.
+     */
+    getParent(element: FlakeNode): FlakeNode | undefined {
+        return element.parent;
+    }
+}
