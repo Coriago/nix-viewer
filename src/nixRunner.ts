@@ -248,6 +248,28 @@ export class NixRunner {
     }
 
     /**
+     * Get comprehensive info about an attribute in a single nix eval call.
+     * This batches type, isDrv, and attrNames/listLength into one query.
+     * Much more efficient than separate calls.
+     */
+    async getAttrInfo(flakePath: string, attrPath: string): Promise<NixEvalResult> {
+        const applyExpr = `x: let
+          t = builtins.typeOf x;
+          isDrv = (x.type or null) == "derivation" || (x ? drvPath);
+        in {
+          type = t;
+          isDrv = isDrv;
+        } // (if t == "set" && !isDrv then {
+          attrNames = builtins.attrNames x;
+        } else {}) // (if t == "list" then {
+          listLength = builtins.length x;
+        } else {})`;
+        
+        const args = this.buildEvalArgs(attrPath, applyExpr);
+        return this.run(args, { cwd: flakePath }, `attrInfo:${attrPath}`);
+    }
+
+    /**
      * Evaluate an attribute and get its value.
      */
     async getValue(flakePath: string, attrPath: string): Promise<NixEvalResult> {

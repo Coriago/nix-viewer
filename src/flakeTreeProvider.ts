@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as os from 'os';
-import { FlakeNode, FlakeNodeType, createLoadingNode, createErrorNode } from './flakeNode';
+import { FlakeNode, FlakeNodeType, NodeMetadata, createLoadingNode, createErrorNode } from './flakeNode';
 import { NixRunner } from './nixRunner';
 import { logger } from './logger';
 
@@ -15,6 +15,9 @@ export interface StatusUpdate {
 
 /**
  * Tree data provider for flake outputs.
+ * 
+ * Uses nixd LSP for fast lookups when available, with NixRunner as fallback.
+ * Implements smart caching that only keeps metadata for expanded nodes.
  */
 export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
     private _onDidChangeTreeData = new vscode.EventEmitter<FlakeNode | undefined | null>();
@@ -44,9 +47,14 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
     /** Resolved username for path substitution */
     private username?: string;
 
-    /** Prefetch cache for common paths */
-    private prefetchCache = new Map<string, FlakeNode[]>();
-    private prefetchInProgress = false;
+    /** Currently expanded paths in the tree view */
+    private expandedPaths = new Set<string>();
+
+    /** Metadata cache for nodes - only keeps data for expanded paths */
+    private metadataCache = new Map<string, NodeMetadata>();
+
+    /** All nodes by path for quick lookup */
+    private nodesByPath = new Map<string, FlakeNode>();
 
     /** Current filter path (for search) */
     private filterPath: string = '';
@@ -143,76 +151,38 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
     }
 
     /**
-     * Get the list of paths to prefetch.
+     * Handle node expansion event from tree view.
+     * Tracks which nodes are expanded for smart refresh.
      */
-    private getPrefetchPaths(): string[] {
-        return vscode.workspace.getConfiguration('nixFlakeExplorer').get<string[]>('prefetchPaths', [
-            'programs',
-            'services',
-            'environment',
-            'system',
-            'users',
-            'nix',
-            'networking',
-            'boot',
-            'hardware',
-            'security'
-        ]);
+    onNodeExpanded(attrPath: string): void {
+        this.expandedPaths.add(attrPath);
+        logger.log(`Node expanded: ${attrPath} (${this.expandedPaths.size} total expanded)`);
     }
 
     /**
-     * Prefetch common config paths in the background.
+     * Handle node collapse event from tree view.
+     * Clears cache for collapsed node and its descendants.
      */
-    async prefetchCommonPaths(): Promise<void> {
-        if (this.prefetchInProgress) {
-            return;
-        }
-
-        const rootPath = this.getRootPath();
-        if (!rootPath) {
-            return;  // Don't prefetch if not using a config root
-        }
-
-        this.prefetchInProgress = true;
-        const pathsToPrefetch = this.getPrefetchPaths();
-
-        logger.log(`Starting prefetch for ${pathsToPrefetch.length} common paths...`);
-        this.emitStatus('info', 'Prefetching common config paths...');
-
-        // Prefetch all paths in parallel
-        const prefetchPromises = pathsToPrefetch.map(async (subPath) => {
-            const fullPath = `${rootPath}.${subPath}`;
-            try {
-                const result = await this.nixRunner.getAttrNames(this.flakePath, fullPath);
-                if (result.success) {
-                    const attrNames = result.data as string[];
-                    const children: FlakeNode[] = attrNames.sort().map(name => {
-                        const childPath = `${fullPath}.${name}`;
-                        const child = new FlakeNode(
-                            name,
-                            childPath,
-                            FlakeNodeType.Attrset,
-                            vscode.TreeItemCollapsibleState.Collapsed
-                        );
-                        // Index path for search
-                        this.indexPath(childPath);
-                        return child;
-                    });
-                    this.prefetchCache.set(fullPath, children);
-                    this.lastGoodChildren.set(fullPath, children);
-                    // Also index the parent path
-                    this.indexPath(fullPath);
-                    logger.log(`✓ Prefetched ${children.length} attrs for: ${subPath}`);
-                }
-            } catch (error) {
-                logger.error(`Prefetch failed for ${fullPath}`, error);
+    onNodeCollapsed(attrPath: string): void {
+        this.expandedPaths.delete(attrPath);
+        
+        // Clear cache for this path and all descendants
+        const pathsToRemove: string[] = [];
+        for (const cachedPath of this.metadataCache.keys()) {
+            if (cachedPath === attrPath || cachedPath.startsWith(attrPath + '.')) {
+                pathsToRemove.push(cachedPath);
             }
-        });
-
-        await Promise.all(prefetchPromises);
-        this.prefetchInProgress = false;
-        logger.log('Prefetch complete');
-        this.emitStatus('success', 'Prefetch complete');
+        }
+        
+        for (const path of pathsToRemove) {
+            this.metadataCache.delete(path);
+            const node = this.nodesByPath.get(path);
+            if (node) {
+                node.clearCache();
+            }
+        }
+        
+        logger.log(`Node collapsed: ${attrPath}, cleared ${pathsToRemove.length} cached paths`);
     }
 
     /**
@@ -220,12 +190,60 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
      */
     refresh(): void {
         this.rootNode = undefined;
-        this.prefetchCache.clear();
+        this.nodesByPath.clear();
         this.knownPaths.clear();
+        // Keep metadataCache - smartRefresh will update expanded nodes
         this._onDidChangeTreeData.fire(undefined);
         this.emitStatus('info', 'Refreshing flake outputs...');
-        // Restart prefetching in background
-        this.prefetchCommonPaths();
+    }
+
+    /**
+     * Smart refresh: only refresh currently expanded nodes.
+     * Refreshes deepest nodes first (most likely to have changes).
+     * Clears cache for non-expanded nodes.
+     */
+    async smartRefresh(): Promise<void> {
+        logger.log(`Smart refresh: ${this.expandedPaths.size} expanded paths`);
+        
+        // Sort expanded paths by depth (deepest first)
+        const sortedPaths = [...this.expandedPaths].sort((a, b) => {
+            const depthA = a.split('.').length;
+            const depthB = b.split('.').length;
+            return depthB - depthA; // Deepest first
+        });
+        
+        // Clear cache for non-expanded paths
+        const pathsToRemove: string[] = [];
+        for (const path of this.metadataCache.keys()) {
+            if (!this.expandedPaths.has(path)) {
+                pathsToRemove.push(path);
+            }
+        }
+        
+        for (const path of pathsToRemove) {
+            this.metadataCache.delete(path);
+            const node = this.nodesByPath.get(path);
+            if (node) {
+                node.clearCache();
+            }
+        }
+        
+        logger.log(`Cleared ${pathsToRemove.length} non-expanded caches`);
+        
+        // Refresh expanded paths (deepest first)
+        for (const path of sortedPaths) {
+            this.metadataCache.delete(path);
+            const node = this.nodesByPath.get(path);
+            if (node) {
+                node.clearCache();
+                this._onDidChangeTreeData.fire(node);
+            }
+        }
+        
+        // Also refresh root
+        this._onDidChangeTreeData.fire(undefined);
+        
+        this.emitStatus('info', `Refreshed ${sortedPaths.length} expanded nodes`);
     }
 
     /**
@@ -333,8 +351,15 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
             if (!element) {
                 // Root level
                 const children = await this.getRootChildren();
+                // Register children for lookup
+                for (const child of children) {
+                    this.nodesByPath.set(child.attrPath, child);
+                }
                 return this.applyFilter(children);
             }
+
+            // Register this element for lookup
+            this.nodesByPath.set(element.attrPath, element);
 
             // Check cache first
             const cached = element.getCachedChildren();
@@ -345,9 +370,10 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
             // Fetch children based on node type
             const children = await this.fetchChildren(element);
 
-            // Index paths for search
+            // Index paths for search and register for lookup
             for (const child of children) {
                 this.indexPath(child.attrPath);
+                this.nodesByPath.set(child.attrPath, child);
             }
 
             // Cache for resilience
@@ -434,23 +460,41 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
      * Fetch children for a specific node.
      */
     private async fetchChildren(parent: FlakeNode): Promise<FlakeNode[]> {
-        // First, determine the type of the parent value
-        const typeResult = await this.nixRunner.getValueType(this.flakePath, parent.attrPath);
+        // Use batched getAttrInfo to get type, isDrv, and attrNames in ONE nix eval call
+        const infoResult = await this.nixRunner.getAttrInfo(this.flakePath, parent.attrPath);
 
-        if (!typeResult.success) {
-            this.emitStatus('error', typeResult.error || 'Failed to get type');
+        if (!infoResult.success) {
+            this.emitStatus('error', infoResult.error || 'Failed to get attr info');
             const lastGood = this.lastGoodChildren.get(parent.attrPath);
             if (lastGood) {
                 return lastGood;
             }
-            return [createErrorNode(typeResult.error || 'Failed to evaluate', parent)];
+            return [createErrorNode(infoResult.error || 'Failed to evaluate', parent)];
         }
 
-        const valueType = typeResult.data as string;
+        const info = infoResult.data as {
+            type: string;
+            isDrv: boolean;
+            attrNames?: string[];
+            listLength?: number;
+        };
 
-        switch (valueType) {
+        // Cache this metadata on the node
+        parent.setMetadata({
+            type: info.type,
+            isDrv: info.isDrv,
+            attrNames: info.attrNames,
+            listLength: info.listLength,
+            timestamp: Date.now()
+        });
+
+        // Also cache in provider-level cache
+        this.metadataCache.set(parent.attrPath, parent.metadata!);
+
+        switch (info.type) {
             case 'set':
-                return this.fetchAttrsetChildren(parent);
+                // We already have attrNames from the batched call
+                return this.buildAttrsetChildren(parent, info);
             case 'list':
                 return this.fetchListChildren(parent);
             default:
@@ -463,18 +507,37 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
     }
 
     /**
-     * Fetch children of an attribute set.
+     * Build children from pre-fetched attribute set info (no additional nix call needed).
      */
-    private async fetchAttrsetChildren(parent: FlakeNode): Promise<FlakeNode[]> {
-        // Check prefetch cache first
-        const prefetched = this.prefetchCache.get(parent.attrPath);
-        if (prefetched) {
-            logger.log(`Using prefetch cache for: ${parent.attrPath}`);
-            // Set parent reference on cached children
-            prefetched.forEach(child => child.parent = parent);
-            return prefetched;
+    private buildAttrsetChildren(parent: FlakeNode, info: { type: string; isDrv: boolean; attrNames?: string[] }): FlakeNode[] {
+        // Update parent type if it's a derivation
+        if (info.isDrv) {
+            parent.nodeType = FlakeNodeType.Derivation;
+            parent.updateAppearance();
         }
 
+        if (!info.attrNames) {
+            // This shouldn't happen for sets, but handle gracefully
+            return [];
+        }
+
+        const children: FlakeNode[] = [];
+
+        for (const name of info.attrNames.sort()) {
+            const child = parent.createChild(name, FlakeNodeType.Attrset);
+            children.push(child);
+            // Track node by path
+            this.nodesByPath.set(child.attrPath, child);
+        }
+
+        this.emitStatus('success', `Loaded ${children.length} attributes`);
+        return children;
+    }
+
+    /**
+     * Fetch children of an attribute set (legacy method, used as fallback).
+     */
+    private async fetchAttrsetChildren(parent: FlakeNode): Promise<FlakeNode[]> {
         // Check if it's a derivation first
         const drvCheck = await this.nixRunner.isDerivation(this.flakePath, parent.attrPath);
 

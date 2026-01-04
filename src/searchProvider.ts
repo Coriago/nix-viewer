@@ -1,10 +1,14 @@
 import { FlakeTreeProvider } from './flakeTreeProvider';
 import { SearchViewProvider } from './searchView';
+import { NixdClient, parsePathForCompletion } from './nixdClient';
 import { logger } from './logger';
 
 /**
  * Provides search/filter functionality for the flake tree view.
  * Connects the search webview to the tree provider.
+ * 
+ * Uses nixd LSP for fast autocomplete when available, with local
+ * path tree as fallback.
  * 
  * Paths are stored and displayed relative to the configured root path.
  * For example, if rootPath is "nixosConfigurations.myhost.config",
@@ -13,6 +17,7 @@ import { logger } from './logger';
 export class SearchProvider {
     private treeProvider: FlakeTreeProvider;
     private searchView: SearchViewProvider;
+    private nixdClient: NixdClient;
     
     /** All known relative paths (relative to root) */
     private allPaths: Set<string> = new Set();
@@ -20,14 +25,40 @@ export class SearchProvider {
     /** Path tree for autocomplete: parent -> children (all relative) */
     private pathTree: Map<string, Set<string>> = new Map();
 
+    /** Whether nixd is available for completions */
+    private nixdAvailable: boolean | null = null;
+
+    /** Debounce timer for nixd requests */
+    private nixdDebounceTimer: NodeJS.Timeout | null = null;
+
+    /** Pending nixd completion request */
+    private pendingNixdRequest: AbortController | null = null;
+
     constructor(treeProvider: FlakeTreeProvider, searchView: SearchViewProvider) {
         this.treeProvider = treeProvider;
         this.searchView = searchView;
+        this.nixdClient = NixdClient.getInstance();
 
         // Listen for search changes from the webview
         this.searchView.onDidChangeSearch((value) => {
             this.handleSearchChange(value);
         });
+
+        // Check nixd availability in background
+        this.checkNixdAvailability();
+    }
+
+    /**
+     * Check if nixd is available for completions.
+     */
+    private async checkNixdAvailability(): Promise<void> {
+        try {
+            this.nixdAvailable = await this.nixdClient.isAvailable();
+            logger.log(`nixd availability: ${this.nixdAvailable}`);
+        } catch (error) {
+            logger.error('Error checking nixd availability', error);
+            this.nixdAvailable = false;
+        }
     }
 
     /**
@@ -67,9 +98,87 @@ export class SearchProvider {
         // Update the filter on the tree provider (using relative path)
         this.treeProvider.setFilterPath(query);
 
-        // Update autocomplete suggestions
-        const suggestions = this.getAutocompleteSuggestions(query);
-        this.searchView.updateSuggestions(suggestions);
+        // Cancel any pending nixd request
+        if (this.pendingNixdRequest) {
+            this.pendingNixdRequest.abort();
+            this.pendingNixdRequest = null;
+        }
+
+        // Clear debounce timer
+        if (this.nixdDebounceTimer) {
+            clearTimeout(this.nixdDebounceTimer);
+            this.nixdDebounceTimer = null;
+        }
+
+        // Get immediate suggestions from local cache (fast)
+        const localSuggestions = this.getLocalAutocompleteSuggestions(query);
+        this.searchView.updateSuggestions(localSuggestions);
+
+        // If nixd is available, also fetch from nixd with debounce (may be slower but more complete)
+        if (this.nixdAvailable && query) {
+            this.nixdDebounceTimer = setTimeout(() => {
+                this.fetchNixdSuggestions(query, localSuggestions);
+            }, 150); // 150ms debounce for nixd requests
+        }
+    }
+
+    /**
+     * Fetch suggestions from nixd and merge with local results.
+     */
+    private async fetchNixdSuggestions(query: string, localSuggestions: string[]): Promise<void> {
+        const abortController = new AbortController();
+        this.pendingNixdRequest = abortController;
+
+        try {
+            const configPath = this.getRootPath();
+            const nixdResults = await this.nixdClient.getConfigCompletion(configPath, query);
+
+            // Check if request was aborted
+            if (abortController.signal.aborted) {
+                return;
+            }
+
+            if (nixdResults.length > 0) {
+                // Merge nixd results with local results, preferring nixd
+                const merged = this.mergeSuggestions(nixdResults, localSuggestions);
+                this.searchView.updateSuggestions(merged);
+                logger.log(`Updated suggestions with ${nixdResults.length} nixd results`);
+            }
+        } catch (error) {
+            if (!abortController.signal.aborted) {
+                logger.error('Error fetching nixd suggestions', error);
+            }
+        } finally {
+            if (this.pendingNixdRequest === abortController) {
+                this.pendingNixdRequest = null;
+            }
+        }
+    }
+
+    /**
+     * Merge nixd suggestions with local suggestions, removing duplicates.
+     */
+    private mergeSuggestions(nixdSuggestions: string[], localSuggestions: string[]): string[] {
+        const seen = new Set<string>();
+        const result: string[] = [];
+
+        // Add nixd suggestions first (they're more authoritative)
+        for (const s of nixdSuggestions) {
+            if (!seen.has(s)) {
+                seen.add(s);
+                result.push(s);
+            }
+        }
+
+        // Add local suggestions that aren't already present
+        for (const s of localSuggestions) {
+            if (!seen.has(s)) {
+                seen.add(s);
+                result.push(s);
+            }
+        }
+
+        return result.slice(0, 30);
     }
 
     /**
@@ -141,9 +250,9 @@ export class SearchProvider {
     }
 
     /**
-     * Get autocomplete suggestions for a query (all paths are relative).
+     * Get autocomplete suggestions from local path tree (fast, cached).
      */
-    private getAutocompleteSuggestions(query: string): string[] {
+    private getLocalAutocompleteSuggestions(query: string): string[] {
         if (!query) {
             // Show top-level relative paths when empty
             const topLevel = this.pathTree.get('');
@@ -244,6 +353,12 @@ export class SearchProvider {
      * Dispose resources.
      */
     dispose(): void {
+        if (this.nixdDebounceTimer) {
+            clearTimeout(this.nixdDebounceTimer);
+        }
+        if (this.pendingNixdRequest) {
+            this.pendingNixdRequest.abort();
+        }
         this.clearIndex();
     }
 }

@@ -79,6 +79,18 @@ export function activate(context: vscode.ExtensionContext): void {
         });
         context.subscriptions.push(treeView);
 
+        // Track expand/collapse events for smart caching
+        context.subscriptions.push(
+            treeView.onDidExpandElement((e) => {
+                treeProvider.onNodeExpanded(e.element.attrPath);
+            })
+        );
+        context.subscriptions.push(
+            treeView.onDidCollapseElement((e) => {
+                treeProvider.onNodeCollapsed(e.element.attrPath);
+            })
+        );
+
         // Update tree view description when filter changes
         treeProvider.onFilterChanged((filterPath) => {
             if (filterPath) {
@@ -114,8 +126,7 @@ export function activate(context: vscode.ExtensionContext): void {
         logger.log('Setting up file watcher...');
         setupFileWatcher(context, workspaceRoot);
 
-        // Start prefetching common paths in the background
-        treeProvider.prefetchCommonPaths();
+        // No more prefetching - data is fetched on demand and cached smartly
 
         logger.log(`✓ Nix Flake Explorer activated successfully for: ${workspaceRoot}`);
         outputChannel.appendLine(`Nix Flake Explorer activated for: ${workspaceRoot}`);
@@ -270,6 +281,7 @@ async function openNodeValue(node: FlakeNode): Promise<void> {
 
 /**
  * Set up file watching for auto-refresh.
+ * Uses smart refresh to only update expanded nodes.
  */
 function setupFileWatcher(
     context: vscode.ExtensionContext,
@@ -292,27 +304,28 @@ function setupFileWatcher(
         new vscode.RelativePattern(workspaceRoot, pattern)
     );
 
-    const triggerRefresh = () => {
+    const triggerSmartRefresh = () => {
         if (debounceTimer) {
             clearTimeout(debounceTimer);
         }
         debounceTimer = setTimeout(() => {
-            outputChannel.appendLine('File change detected, refreshing...');
-            treeProvider.refresh();
+            outputChannel.appendLine('File change detected, smart refreshing expanded nodes...');
+            // Use smart refresh to only update expanded nodes
+            treeProvider.smartRefresh();
         }, debounceMs);
     };
 
-    fileWatcher.onDidChange(triggerRefresh);
-    fileWatcher.onDidCreate(triggerRefresh);
-    fileWatcher.onDidDelete(triggerRefresh);
+    fileWatcher.onDidChange(triggerSmartRefresh);
+    fileWatcher.onDidCreate(triggerSmartRefresh);
+    fileWatcher.onDidDelete(triggerSmartRefresh);
 
     context.subscriptions.push(fileWatcher);
 
-    // Also watch for configuration changes
+    // Also watch for configuration changes - these need a full refresh
     context.subscriptions.push(
         vscode.workspace.onDidChangeConfiguration((e) => {
             if (e.affectsConfiguration('nixFlakeExplorer')) {
-                outputChannel.appendLine('Configuration changed, refreshing...');
+                outputChannel.appendLine('Configuration changed, full refresh...');
                 treeProvider.refresh();
             }
         })

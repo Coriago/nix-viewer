@@ -21,7 +21,27 @@ export enum FlakeNodeType {
 }
 
 /**
- * Cached data for a node.
+ * Metadata about a node's value, fetched from nixd or nix eval.
+ * This is the cached information about what the node contains.
+ */
+export interface NodeMetadata {
+    /** The nix type: 'set', 'list', 'string', 'int', 'bool', etc. */
+    type: string;
+    /** Whether this value is a derivation */
+    isDrv: boolean;
+    /** Attribute names if this is a set */
+    attrNames?: string[];
+    /** List length if this is a list */
+    listLength?: number;
+    /** The actual value for leaf nodes */
+    value?: unknown;
+    /** When this metadata was fetched */
+    timestamp: number;
+}
+
+/**
+ * Legacy cache interface for backwards compatibility during migration.
+ * @deprecated Use NodeMetadata instead
  */
 export interface FlakeNodeCache {
     children?: FlakeNode[];
@@ -42,7 +62,13 @@ export class FlakeNode extends vscode.TreeItem {
     /** Index if this is a list element */
     public listIndex?: number;
 
-    /** Cached children and value */
+    /** Cached metadata about this node's value */
+    public metadata?: NodeMetadata;
+
+    /** Cached children (derived from metadata.attrNames) */
+    private _cachedChildren?: FlakeNode[];
+    
+    /** Legacy cache for backwards compatibility */
     public cache?: FlakeNodeCache;
 
     /** Parent node (if any) */
@@ -170,8 +196,18 @@ export class FlakeNode extends vscode.TreeItem {
 
     /**
      * Get cached children if available and not expired.
+     * Now uses metadata.attrNames to derive children.
      */
     getCachedChildren(maxAgeMs = 60000): FlakeNode[] | undefined {
+        // First check new metadata-based cache
+        if (this.metadata?.attrNames && this._cachedChildren) {
+            const age = Date.now() - this.metadata.timestamp;
+            if (age <= maxAgeMs) {
+                return this._cachedChildren;
+            }
+        }
+        
+        // Fall back to legacy cache
         if (!this.cache?.children) {
             return undefined;
         }
@@ -188,11 +224,53 @@ export class FlakeNode extends vscode.TreeItem {
      * Cache children for this node.
      */
     cacheChildren(children: FlakeNode[]): void {
+        this._cachedChildren = children;
+        // Also update legacy cache for compatibility
         this.cache = {
             ...this.cache,
             children,
             timestamp: Date.now(),
         };
+    }
+
+    /**
+     * Set metadata for this node.
+     */
+    setMetadata(metadata: NodeMetadata): void {
+        this.metadata = metadata;
+        
+        // Update node type based on metadata
+        if (metadata.isDrv) {
+            this.nodeType = FlakeNodeType.Derivation;
+        } else if (metadata.type === 'set') {
+            this.nodeType = FlakeNodeType.Attrset;
+        } else if (metadata.type === 'list') {
+            this.nodeType = FlakeNodeType.List;
+        } else {
+            this.nodeType = FlakeNodeType.Leaf;
+        }
+        
+        this.updateAppearance();
+    }
+
+    /**
+     * Clear all cached data for this node.
+     */
+    clearCache(): void {
+        this.metadata = undefined;
+        this._cachedChildren = undefined;
+        this.cache = undefined;
+    }
+
+    /**
+     * Check if this node has valid cached metadata.
+     */
+    hasValidMetadata(maxAgeMs = 60000): boolean {
+        if (!this.metadata) {
+            return false;
+        }
+        const age = Date.now() - this.metadata.timestamp;
+        return age <= maxAgeMs;
     }
 
     /**
