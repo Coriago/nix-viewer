@@ -101,7 +101,6 @@
                         "type": "string"
                     },
                     "default": [
-                        "--no-write-lock-file",
                         "--offline"
                     ],
                     "description": "Extra arguments to pass to nix commands."

@@ -27,7 +27,7 @@ export class NixRunner {
     private getConfig() {
         const config = vscode.workspace.getConfiguration('nixFlakeExplorer');
         return {
-            nixArgs: config.get<string[]>('nixArgs', ['--no-write-lock-file', '--offline']),
+            nixArgs: config.get<string[]>('nixArgs', ['--offline']),
             experimentalFeatures: config.get<string[]>('experimentalFeatures', ['nix-command', 'flakes']),
             debounceMs: config.get<number>('debounceMs', 500),
         };
@@ -115,7 +115,9 @@ export class NixRunner {
         return new Promise((resolve) => {
             const fullArgs = [...this.buildBaseArgs(), ...args];
 
-            this.outputChannel.appendLine(`> nix ${fullArgs.join(' ')}`);
+            const cmdLine = `> nix ${fullArgs.join(' ')}`;
+            console.log(cmdLine);
+            this.outputChannel.appendLine(cmdLine);
 
             const proc = spawn('nix', fullArgs, {
                 cwd: options.cwd,
@@ -157,7 +159,9 @@ export class NixRunner {
                         resolve({ success: true, data: stdout.trim() });
                     }
                 } else {
-                    this.outputChannel.appendLine(`Error: ${stderr}`);
+                    const errorMsg = `Error: ${stderr}`;
+                    console.error(errorMsg);
+                    this.outputChannel.appendLine(errorMsg);
                     resolve({ success: false, error: stderr.trim() || `Exit code ${code}` });
                 }
             });
@@ -165,7 +169,9 @@ export class NixRunner {
             proc.on('error', (err) => {
                 clearTimeout(timer);
                 this.activeProcesses.delete(processKey);
-                this.outputChannel.appendLine(`Spawn error: ${err.message}`);
+                const spawnError = `Spawn error: ${err.message}`;
+                console.error(spawnError);
+                this.outputChannel.appendLine(spawnError);
                 resolve({ success: false, error: err.message });
             });
         });

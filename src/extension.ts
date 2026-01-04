@@ -16,55 +16,80 @@ let debounceTimer: NodeJS.Timeout | undefined;
  * Extension activation.
  */
 export function activate(context: vscode.ExtensionContext): void {
-    outputChannel = vscode.window.createOutputChannel('Nix Flake Explorer');
-    context.subscriptions.push(outputChannel);
-    outputChannel.show(); // Show output panel on activation
-    outputChannel.appendLine('=== Nix Flake Explorer Activating ===');
+    try {
+        console.log('=== Nix Flake Explorer: Starting activation ===');
+        outputChannel = vscode.window.createOutputChannel('Nix Flake Explorer');
+        context.subscriptions.push(outputChannel);
+        outputChannel.show(); // Show output panel on activation
+        outputChannel.appendLine('=== Nix Flake Explorer Activating ===');
 
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) {
-        outputChannel.appendLine('ERROR: No workspace folder found');
-        vscode.window.showErrorMessage('Nix Flake Explorer: No workspace folder found');
-        return;
+        const workspaceRoot = getWorkspaceRoot();
+        if (!workspaceRoot) {
+            const msg = 'ERROR: No workspace folder found';
+            console.error(msg);
+            outputChannel.appendLine(msg);
+            vscode.window.showErrorMessage('Nix Flake Explorer: No workspace folder found');
+            return;
+        }
+        console.log(`Workspace root: ${workspaceRoot}`);
+        outputChannel.appendLine(`Workspace root: ${workspaceRoot}`);
+
+        // Check for flake.nix
+        const flakePath = path.join(workspaceRoot, 'flake.nix');
+        console.log(`Looking for flake at: ${flakePath}`);
+        outputChannel.appendLine(`Looking for flake at: ${flakePath}`);
+
+        // Initialize components
+        console.log('Initializing NixRunner...');
+        nixRunner = new NixRunner(outputChannel);
+        console.log('Initializing FlakeTreeProvider...');
+        treeProvider = new FlakeTreeProvider(workspaceRoot, nixRunner);
+        console.log('Initializing StatusViewProvider...');
+        statusProvider = new StatusViewProvider(context.extensionUri);
+
+        // Connect status updates
+        treeProvider.onStatusUpdate((update) => {
+            statusProvider.updateStatus(update);
+        });
+
+        // Register tree view
+        console.log('Registering tree view...');
+        const treeView = vscode.window.createTreeView('flakeOutputsTree', {
+            treeDataProvider: treeProvider,
+            showCollapseAll: true,
+        });
+        context.subscriptions.push(treeView);
+
+        // Register status webview
+        console.log('Registering status webview...');
+        context.subscriptions.push(
+            vscode.window.registerWebviewViewProvider(
+                StatusViewProvider.viewType,
+                statusProvider
+            )
+        );
+
+        // Register commands
+        console.log('Registering commands...');
+        registerCommands(context, treeView);
+
+        // Set up file watching
+        console.log('Setting up file watcher...');
+        setupFileWatcher(context, workspaceRoot);
+
+        console.log(`✓ Nix Flake Explorer activated successfully for: ${workspaceRoot}`);
+        outputChannel.appendLine(`Nix Flake Explorer activated for: ${workspaceRoot}`);
+    } catch (error) {
+        const errorMsg = `FATAL ERROR during activation: ${error}`;
+        console.error(errorMsg);
+        console.error(error);
+        if (outputChannel) {
+            outputChannel.appendLine(errorMsg);
+            outputChannel.appendLine(String(error));
+        }
+        vscode.window.showErrorMessage(`Nix Flake Explorer failed to activate: ${error}`);
+        throw error;
     }
-    outputChannel.appendLine(`Workspace root: ${workspaceRoot}`);
-
-    // Check for flake.nix
-    const flakePath = path.join(workspaceRoot, 'flake.nix');
-    outputChannel.appendLine(`Looking for flake at: ${flakePath}`);
-
-    // Initialize components
-    nixRunner = new NixRunner(outputChannel);
-    treeProvider = new FlakeTreeProvider(workspaceRoot, nixRunner);
-    statusProvider = new StatusViewProvider(context.extensionUri);
-
-    // Connect status updates
-    treeProvider.onStatusUpdate((update) => {
-        statusProvider.updateStatus(update);
-    });
-
-    // Register tree view
-    const treeView = vscode.window.createTreeView('flakeOutputsTree', {
-        treeDataProvider: treeProvider,
-        showCollapseAll: true,
-    });
-    context.subscriptions.push(treeView);
-
-    // Register status webview
-    context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider(
-            StatusViewProvider.viewType,
-            statusProvider
-        )
-    );
-
-    // Register commands
-    registerCommands(context, treeView);
-
-    // Set up file watching
-    setupFileWatcher(context, workspaceRoot);
-
-    outputChannel.appendLine(`Nix Flake Explorer activated for: ${workspaceRoot}`);
 }
 
 /**

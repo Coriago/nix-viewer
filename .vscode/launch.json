@@ -1,26 +1,18 @@
 {
   "version": "0.2.0",
   "configurations": [
+
     {
       "name": "Run Extension",
       "type": "extensionHost",
       "request": "launch",
+      "runtimeExecutable": "${execPath}",
       "args": [
-        "--extensionDevelopmentPath=${workspaceFolder}/extension",
-        "--folder-uri=${workspaceFolder}"
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "${env:HOME}/.config/nixos"
       ],
-      "outFiles": ["${workspaceFolder}/extension/out/**/*.js"],
-      "preLaunchTask": "npm: watch - extension"
-    },
-    {
-      "name": "Run Extension (No Watch)",
-      "type": "extensionHost",
-      "request": "launch",
-      "args": [
-        "--extensionDevelopmentPath=${workspaceFolder}/extension",
-        "--folder-uri=${workspaceFolder}"
-      ],
-      "outFiles": ["${workspaceFolder}/extension/out/**/*.js"]
+      "outFiles": ["${workspaceFolder}/out/**/*.js"],
+      "preLaunchTask": "npm: watch"
     }
   ]
 }
