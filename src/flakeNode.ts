@@ -70,7 +70,7 @@ export class FlakeNode extends vscode.TreeItem {
     updateAppearance(): void {
         switch (this.nodeType) {
             case FlakeNodeType.Attrset:
-                this.iconPath = new vscode.ThemeIcon('symbol-namespace');
+                this.iconPath = undefined;  // No icon for attrsets - cleaner view
                 this.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 break;
             case FlakeNodeType.List:

@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as os from 'os';
 import { FlakeNode, FlakeNodeType, createLoadingNode, createErrorNode } from './flakeNode';
 import { NixRunner } from './nixRunner';
 import { logger } from './logger';
@@ -29,12 +30,26 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
     /** Last known good state for error resilience */
     private lastGoodChildren = new Map<string, FlakeNode[]>();
 
+    /** Resolved hostname for path substitution */
+    private hostname?: string;
+
+    /** Resolved username for path substitution */
+    private username?: string;
+
+    /** Prefetch cache for common paths */
+    private prefetchCache = new Map<string, FlakeNode[]>();
+    private prefetchInProgress = false;
+
     constructor(
         flakePath: string,
         nixRunner: NixRunner
     ) {
         this.flakePath = flakePath;
         this.nixRunner = nixRunner;
+        // Resolve system info synchronously at construction time
+        this.hostname = os.hostname();
+        this.username = os.userInfo().username;
+        logger.log(`Resolved hostname: ${this.hostname}, user: ${this.username}`);
     }
 
     /**
@@ -49,7 +64,80 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
      * Get the configured root path.
      */
     private getRootPath(): string {
-        return vscode.workspace.getConfiguration('nixFlakeExplorer').get<string>('rootPath', '');
+        const configValue = vscode.workspace.getConfiguration('nixFlakeExplorer').get<string>('rootPath', 'nixosConfigurations.${hostname}.config');
+        
+        // Replace ${hostname} and ${user} placeholders
+        return configValue
+            .replace(/\$\{hostname\}/g, this.hostname || '')
+            .replace(/\$\{user\}/g, this.username || '');
+    }
+
+    /**
+     * Get the list of paths to prefetch.
+     */
+    private getPrefetchPaths(): string[] {
+        return vscode.workspace.getConfiguration('nixFlakeExplorer').get<string[]>('prefetchPaths', [
+            'programs',
+            'services',
+            'environment',
+            'system',
+            'users',
+            'nix',
+            'networking',
+            'boot',
+            'hardware',
+            'security'
+        ]);
+    }
+
+    /**
+     * Prefetch common config paths in the background.
+     */
+    async prefetchCommonPaths(): Promise<void> {
+        if (this.prefetchInProgress) {
+            return;
+        }
+
+        const rootPath = this.getRootPath();
+        if (!rootPath) {
+            return;  // Don't prefetch if not using a config root
+        }
+
+        this.prefetchInProgress = true;
+        const pathsToPrefetch = this.getPrefetchPaths();
+
+        logger.log(`Starting prefetch for ${pathsToPrefetch.length} common paths...`);
+        this.emitStatus('info', 'Prefetching common config paths...');
+
+        // Prefetch all paths in parallel
+        const prefetchPromises = pathsToPrefetch.map(async (subPath) => {
+            const fullPath = `${rootPath}.${subPath}`;
+            try {
+                const result = await this.nixRunner.getAttrNames(this.flakePath, fullPath);
+                if (result.success) {
+                    const attrNames = result.data as string[];
+                    const children: FlakeNode[] = attrNames.sort().map(name => {
+                        const child = new FlakeNode(
+                            name,
+                            `${fullPath}.${name}`,
+                            FlakeNodeType.Attrset,
+                            vscode.TreeItemCollapsibleState.Collapsed
+                        );
+                        return child;
+                    });
+                    this.prefetchCache.set(fullPath, children);
+                    this.lastGoodChildren.set(fullPath, children);
+                    logger.log(`✓ Prefetched ${children.length} attrs for: ${subPath}`);
+                }
+            } catch (error) {
+                logger.error(`Prefetch failed for ${fullPath}`, error);
+            }
+        });
+
+        await Promise.all(prefetchPromises);
+        this.prefetchInProgress = false;
+        logger.log('Prefetch complete');
+        this.emitStatus('success', 'Prefetch complete');
     }
 
     /**
@@ -57,8 +145,11 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
      */
     refresh(): void {
         this.rootNode = undefined;
+        this.prefetchCache.clear();
         this._onDidChangeTreeData.fire(undefined);
         this.emitStatus('info', 'Refreshing flake outputs...');
+        // Restart prefetching in background
+        this.prefetchCommonPaths();
     }
 
     /**
@@ -220,6 +311,15 @@ export class FlakeTreeProvider implements vscode.TreeDataProvider<FlakeNode> {
      * Fetch children of an attribute set.
      */
     private async fetchAttrsetChildren(parent: FlakeNode): Promise<FlakeNode[]> {
+        // Check prefetch cache first
+        const prefetched = this.prefetchCache.get(parent.attrPath);
+        if (prefetched) {
+            logger.log(`Using prefetch cache for: ${parent.attrPath}`);
+            // Set parent reference on cached children
+            prefetched.forEach(child => child.parent = parent);
+            return prefetched;
+        }
+
         // Check if it's a derivation first
         const drvCheck = await this.nixRunner.isDerivation(this.flakePath, parent.attrPath);
 

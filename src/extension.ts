@@ -78,6 +78,9 @@ export function activate(context: vscode.ExtensionContext): void {
         logger.log('Setting up file watcher...');
         setupFileWatcher(context, workspaceRoot);
 
+        // Start prefetching common paths in the background
+        treeProvider.prefetchCommonPaths();
+
         logger.log(`✓ Nix Flake Explorer activated successfully for: ${workspaceRoot}`);
         outputChannel.appendLine(`Nix Flake Explorer activated for: ${workspaceRoot}`);
     } catch (error) {

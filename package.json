@@ -92,8 +92,27 @@
             "properties": {
                 "nixFlakeExplorer.rootPath": {
                     "type": "string",
-                    "default": "",
-                    "description": "Attribute path to use as root of the tree (e.g., 'nixosConfigurations.myhost.config'). Leave empty to show all flake outputs."
+                    "default": "nixosConfigurations.${hostname}.config",
+                    "description": "Attribute path to use as root of the tree. Use ${hostname} for system hostname and ${user} for current username, or leave empty to show all flake outputs."
+                },
+                "nixFlakeExplorer.prefetchPaths": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [
+                        "programs",
+                        "services",
+                        "environment",
+                        "system",
+                        "users",
+                        "nix",
+                        "networking",
+                        "boot",
+                        "hardware",
+                        "security"
+                    ],
+                    "description": "Common config paths to prefetch at startup for faster browsing."
                 },
                 "nixFlakeExplorer.nixArgs": {
                     "type": "array",
